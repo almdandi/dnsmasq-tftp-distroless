@@ -1,0 +1,86 @@
+name: Build dnsmasq TFTP
+
+on:
+  schedule:
+    - cron: '0 12 * * *' # Every day at 12:00 UTC
+  workflow_dispatch:      # Allows manual triggering
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. Install skopeo to inspect remote image manifests
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y skopeo jq
+
+      # 2. Get latest dnsmasq version from upstream
+      - name: Get upstream version
+        id: upstream
+        run: |
+          VER=$(curl -s https://thekelleys.org.uk/dnsmasq/ | grep -oP 'dnsmasq-\K[0-9.]+(?=\.tar\.xz)' | sort -V | tail -1)
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+
+      # 3. Get current base image digest from GCR
+      - name: Get base image digest
+        id: base
+        run: |
+          DIGEST=$(skopeo inspect docker://gcr.io/distroless/base-debian12:nonroot | jq -r '.Digest')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      # 4. Check labels of the image currently in your registry
+      - name: Check registry for existing image
+        id: current
+        continue-on-error: true
+        run: |
+          INSPECT=$(skopeo inspect docker://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest)
+          echo "old_ver=$(echo $INSPECT | jq -r '.Labels["org.opencontainers.image.version"]')" >> $GITHUB_OUTPUT
+          echo "old_base=$(echo $INSPECT | jq -r '.Labels["org.opencontainers.image.base.digest"]')" >> $GITHUB_OUTPUT
+
+      # 5. Comparison Logic
+      - name: Decide to build
+        id: decision
+        run: |
+          BUILD="false"
+          if [ "${{ steps.upstream.outputs.ver }}" != "${{ steps.current.outputs.old_ver }}" ]; then
+            echo "New dnsmasq version detected."
+            BUILD="true"
+          elif [ "${{ steps.base.outputs.digest }}" != "${{ steps.current.outputs.old_base }}" ]; then
+            echo "New Distroless base image detected."
+            BUILD="true"
+          else
+            echo "No changes detected. Skipping build."
+          fi
+          echo "needed=$BUILD" >> $GITHUB_OUTPUT
+
+      # 6. Login and Build (Only if needed)
+      - name: Log in to GHCR
+        if: steps.decision.outputs.needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.decision.outputs.needed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            DNSMASQ_VER=${{ steps.upstream.outputs.ver }}
+            BASE_DIGEST=${{ steps.base.outputs.digest }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.ver }}
